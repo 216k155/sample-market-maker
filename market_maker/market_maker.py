@@ -205,6 +205,13 @@ class OrderManager:
         # on any error.
         atexit.register(self.exit)
         signal.signal(signal.SIGTERM, self.exit)
+        self.martin_signal = False
+        self.balance_signal = False
+        # cache tick data
+        self.last_position = 0
+        self.size = 20
+        self.buys = np.zeros(self.size)
+        self.sells = np.zeros(self.size)
 
         logger.info("Using symbol %s." % self.exchange.symbol)
 
@@ -214,13 +221,18 @@ class OrderManager:
             logger.info("Order Manager initializing, connecting to BitMEX. Live run: executing real trades.")
 
         self.start_time = datetime.now()
+        self.last_position_change_time = datetime.now()
+        self.last_reset_time = datetime.now()
+        self.resetting = False
         self.instrument = self.exchange.get_instrument()
         self.starting_qty = self.exchange.get_delta()
         self.running_qty = self.starting_qty
         self.reset()
 
     def reset(self):
+        if settings.RESET:
         self.exchange.cancel_all_orders()
+
         self.sanity_check()
         self.print_status()
 
@@ -235,6 +247,7 @@ class OrderManager:
         self.running_qty = self.exchange.get_delta()
         tickLog = self.exchange.get_instrument()['tickLog']
         self.start_XBt = margin["marginBalance"]
+        orders = self.exchange.get_orders()
 
         logger.info("Current XBT Balance: %.6f" % XBt_to_XBT(self.start_XBt))
         logger.info("Current Contract Position: %d" % self.running_qty)
@@ -245,6 +258,8 @@ class OrderManager:
             logger.info("Avg Entry Price: %.*f" % (tickLog, float(position['avgEntryPrice'])))
         logger.info("Contracts Traded This Run: %d" % (self.running_qty - self.starting_qty))
         logger.info("Total Contract Delta: %.4f XBT" % self.exchange.calc_delta()['spot'])
+        for order in orders:
+            logger.info("now existed order price %f, amount %d, side %s" % (order['price'], order['orderQty'],order['side']))
 
     def get_ticker(self):
         ticker = self.exchange.get_ticker()
@@ -303,6 +318,33 @@ class OrderManager:
 
         return math.toNearest(start_position * (1 + settings.INTERVAL) ** index, self.instrument['tickSize'])
 
+
+    def get_fibonacci_price_offset(self, index):
+        """Given an index (1, -1, 2, -2, etc.) return the price for that side of the book.
+           Negative is a buy, positive is a sell."""
+        # Maintain existing spreads for max profit
+        if settings.MAINTAIN_SPREADS:
+            start_position = self.start_position_buy if index < 0 else self.start_position_sell
+        else:
+            # Offset mode: ticker comes from a reference exchange and we define an offset.
+            start_position = self.start_position_buy if index < 0 else self.start_position_sell
+
+            # If we're attempting to sell, but our sell price is actually lower than the buy,
+            # move over to the sell side.
+            if index > 0 and start_position < self.start_position_buy:
+                start_position = self.start_position_sell
+            # Same for buys.
+            if index < 0 and start_position > self.start_position_sell:
+                start_position = self.start_position_buy
+
+        if index > 0:
+            return math.toNearest(start_position + start_position * settings.INTERVAL * (fib(index) - 1),
+                                  self.instrument['tickSize'])
+        else:
+            return math.toNearest(start_position - start_position * settings.INTERVAL * (fib(index) - 1),
+                                  self.instrument['tickSize'])
+
+
     ###
     # Orders
     ###
@@ -316,13 +358,127 @@ class OrderManager:
         # then we match orders from the outside in, ensuring the fewest number of orders are amended and only
         # a new order is created in the inside. If we did it inside-out, all orders would be amended
         # down and a new order would be created at the outside.
-        for i in reversed(range(1, settings.ORDER_PAIRS + 1)):
-            if not self.long_position_limit_exceeded():
-                buy_orders.append(self.prepare_order(-i))
-            if not self.short_position_limit_exceeded():
-                sell_orders.append(self.prepare_order(i))
+        # if not self.check_stable():
+        #     print('Current not stable')
+        #     return
+        existing_orders = self.exchange.get_orders()
+        position = self.exchange.get_position()
+        cost = 0
+        if position['currentQty'] != 0:
+            cost = float(position['avgCostPrice'])
+        print('last position %d, now position %d, balance %r, martin %r cost %f, midprice %f' %
+              (self.last_position, position['currentQty'], self.balance_signal,
+               self.martin_signal, cost, self.start_position_mid))
 
-        return self.converge_orders(buy_orders, sell_orders)
+        if self.last_position != position['currentQty']:
+            self.last_position_change_time = datetime.now()
+        if not self.resetting:
+            if datetime.now() - self.last_position_change_time >= timedelta(minutes=settings.RESET_TIME) and \
+                    datetime.now() - self.last_reset_time >= timedelta(minutes=settings.RESET_TIME):
+                self.last_reset_time = datetime.now()
+                self.resetting = True
+                self.reset()
+                return
+        self.resetting = False
+
+        if settings.FIBONACCI_METHOD:
+            for i in reversed(range(1, settings.ORDER_PAIRS + 1)):
+                if not self.long_position_limit_exceeded():
+                    buy_orders.append(self.prepare_fibonacci_order(-i))
+                if not self.short_position_limit_exceeded():
+                    sell_orders.append(self.prepare_fibonacci_order(i))
+        else:
+            for i in reversed(range(1, settings.ORDER_PAIRS + 1)):
+                if not self.long_position_limit_exceeded():
+                    buy_orders.append(self.prepare_order(-i))
+                if not self.short_position_limit_exceeded():
+                    sell_orders.append(self.prepare_order(i))
+        if not self.long_position_limit_exceeded() and not self.short_position_limit_exceeded():
+            self.martin_signal = False
+
+        if self.long_position_limit_exceeded() and settings.MARTIN_STRATEGY and cost < sell_orders[-1]['price'] and \
+                not self.martin_signal:
+            sell_orders[-1]['orderQty'] = abs(position['currentQty'])
+            self.martin_signal = True
+            return self.converge_orders(buy_orders, sell_orders, True)
+
+        if self.short_position_limit_exceeded() and settings.MARTIN_STRATEGY and cost > buy_orders[-1]['price'] and \
+                not self.martin_signal:
+            buy_orders[-1]['orderQty'] = abs(position['currentQty'])
+            self.martin_signal = True
+            return self.converge_orders(buy_orders, sell_orders, True)
+
+        if abs(position['currentQty']) <= settings.RESET_LIST_LIMIT and position['currentQty'] != self.last_position:
+            self.last_position = position['currentQty']
+            return self.converge_orders(buy_orders, sell_orders, True)
+
+        if position['currentQty'] > 0:
+            if abs(position['currentQty']) > sell_orders[-1]['orderQty'] and cost < self.start_position_mid:
+                self.last_position = position['currentQty']
+                sell_orders[-1]['orderQty'] = settings.ORDER_START_SIZE * 2
+
+            # if position['currentQty'] < self.last_position and \
+            #         abs(position['currentQty']) <= settings.MIN_BALANCE_VOLUME:
+            #     self.last_position = position['currentQty']
+            #     return self.converge_orders(buy_orders, sell_orders)
+            # elif position['currentQty'] > self.last_position and \
+            #         abs(position['currentQty']) <= settings.MIN_BALANCE_VOLUME:
+            #     self.last_position = position['currentQty']
+            #     # sell_orders[-1]['orderQty'] = abs(position['currentQty'])
+            #     return self.converge_orders(buy_orders, sell_orders)
+            # elif abs(position['currentQty']) > settings.MIN_BALANCE_VOLUME and cost < self.start_position_mid and \
+            #         (not self.balance_signal or len(existing_orders) == 0):
+            #     print("keep balance")
+            #     self.balance_signal = True
+            #     self.last_position = position['currentQty']
+            #     sell_orders[-1]['orderQty'] = int(abs(position['currentQty']) *  2 / 3)
+            #     sell_orders[-2]['orderQty'] = abs(position['currentQty']) - sell_orders[-1]['orderQty']
+            #     return self.converge_sell_orders(sell_orders)
+            # elif position['currentQty'] != self.last_position and self.balance_signal:
+            #     self.balance_signal = False
+
+        elif position['currentQty'] < 0:
+            if abs(position['currentQty']) > buy_orders[-1]['orderQty'] and cost > self.start_position_mid:
+                self.last_position = position['currentQty']
+                buy_orders[-1]['orderQty'] = settings.ORDER_START_SIZE * 2
+
+            # if position['currentQty'] > self.last_position and abs(
+            #         position['currentQty']) <= settings.MIN_BALANCE_VOLUME:
+            #     self.last_position = position['currentQty']
+            #     return self.converge_orders(buy_orders, sell_orders)
+            # elif position['currentQty'] < self.last_position and abs(
+            #         position['currentQty']) <= settings.MIN_BALANCE_VOLUME:
+            #     # buy_orders[-1]['orderQty'] = abs(position['currentQty'])
+            #     self.last_position = position['currentQty']
+            #     return self.converge_orders(buy_orders, sell_orders)
+            # elif abs(position['currentQty']) > settings.MIN_BALANCE_VOLUME and cost > self.start_position_mid and \
+            #         (not self.balance_signal or len(existing_orders) == 0):
+            #     self.balance_signal = True
+            #     self.last_position = position['currentQty']
+            #     buy_orders[-1]['orderQty'] = int(abs(position['currentQty']) *  2 / 3)
+            #     buy_orders[-2]['orderQty'] = abs(position['currentQty']) - sell_orders[-1]['orderQty']
+            #     return self.converge_buy_orders(buy_orders)
+            # elif position['currentQty'] != self.last_position and self.balance_signal:
+            #     self.balance_signal = False
+
+        print(buy_orders)
+        print(sell_orders)
+        print('No condition match')
+        self.last_position = position['currentQty']
+        return self.converge_orders(buy_orders, sell_orders, self.martin_signal)
+
+    def prepare_fibonacci_order(self, index):
+        if settings.EXPON_ORDER_SIZE:
+            quantity = settings.ORDER_START_SIZE * 2 ** (abs(index) - 1)
+        else:
+            quantity = settings.ORDER_START_SIZE + ((abs(index) - 1) * settings.ORDER_STEP_SIZE)
+
+        price = self.get_fibonacci_price_offset(index)
+
+        if settings.MIN_ORDER_SIZE and quantity < settings.MIN_ORDER_SIZE:
+            quantity = settings.MIN_ORDER_SIZE
+
+        return {'price': price, 'orderQty': quantity, 'side': "Buy" if index < 0 else "Sell"}
 
     def prepare_order(self, index):
         """Create an order object."""
@@ -336,12 +492,149 @@ class OrderManager:
 
         return {'price': price, 'orderQty': quantity, 'side': "Buy" if index < 0 else "Sell"}
 
-    def converge_orders(self, buy_orders, sell_orders):
+    def converge_sell_orders(self, sell_orders):
+
+        tickLog = self.exchange.get_instrument()['tickLog']
+        to_amend = []
+        to_create = []
+        to_cancel = []
+        buys_matched = 0
+        sells_matched = 0
+        existing_orders = self.exchange.get_orders()
+
+
+        # Check all existing orders and match them up with what we want to place.
+        # If there's an open one, we might be able to amend it to fit what we want.
+        for order in existing_orders:
+            try:
+                if order['side'] == 'Sell':
+                    desired_order = sell_orders[sells_matched]
+                    sells_matched += 1
+
+                    to_amend.append({'orderID': order['orderID'],
+                                     'orderQty': order['cumQty'] + desired_order['orderQty'],
+                                     'price': desired_order['price'], 'side': order['side']})
+
+            except IndexError:
+                # Will throw if there isn't a desired order to match. In that case, cancel it.
+                to_cancel.append(order)
+
+        while sells_matched < len(sell_orders):
+            to_create.append(sell_orders[sells_matched])
+            sells_matched += 1
+
+        if len(to_amend) > 0:
+            for amended_order in reversed(to_amend):
+                reference_order = [o for o in existing_orders if o['orderID'] == amended_order['orderID']][0]
+                logger.info("Amending %4s: %d @ %.*f to %d @ %.*f (%+.*f)" % (
+                    amended_order['side'],
+                    reference_order['leavesQty'], tickLog, reference_order['price'],
+                    (amended_order['orderQty'] - reference_order['cumQty']), tickLog, amended_order['price'],
+                    tickLog, (amended_order['price'] - reference_order['price'])
+                ))
+            # This can fail if an order has closed in the time we were processing.
+            # The API will send us `invalid ordStatus`, which means that the order's status (Filled/Canceled)
+            # made it not amendable.
+            # If that happens, we need to catch it and re-tick.
+            try:
+                self.exchange.amend_bulk_orders(to_amend)
+            except requests.exceptions.HTTPError as e:
+                errorObj = e.response.json()
+                if errorObj['error']['message'] == 'Invalid ordStatus':
+                    logger.warn("Amending failed. Waiting for order data to converge and retrying.")
+                    sleep(0.5)
+                    return self.place_orders()
+                else:
+                    logger.error("Unknown error on amend: %s. Exiting" % errorObj)
+                    sys.exit(1)
+
+        if len(to_create) > 0:
+            logger.info("Creating %d orders:" % (len(to_create)))
+            for order in reversed(to_create):
+                logger.info("%4s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
+            self.exchange.create_bulk_orders(to_create)
+
+        # Could happen if we exceed a delta limit
+        if len(to_cancel) > 0:
+            logger.info("Canceling %d orders:" % (len(to_cancel)))
+            for order in reversed(to_cancel):
+                logger.info("%4s %d @ %.*f" % (order['side'], order['leavesQty'], tickLog, order['price']))
+            self.exchange.cancel_bulk_orders(to_cancel)
+
+    def converge_buy_orders(self, buy_orders):
+        tickLog = self.exchange.get_instrument()['tickLog']
+        to_amend = []
+        to_create = []
+        to_cancel = []
+        buys_matched = 0
+        existing_orders = self.exchange.get_orders()
+
+        for order in existing_orders:
+            try:
+                if order['side'] == 'Buy':
+                    desired_order = buy_orders[buys_matched]
+                    buys_matched += 1
+
+                    to_amend.append(
+                        {'orderID': order['orderID'], 'orderQty': order['cumQty'] + desired_order['orderQty'],
+                         'price': desired_order['price'], 'side': order['side']})
+
+            except IndexError:
+                # Will throw if there isn't a desired order to match. In that case, cancel it.
+                to_cancel.append(order)
+
+        while buys_matched < len(buy_orders):
+            to_create.append(buy_orders[buys_matched])
+            buys_matched += 1
+
+        if len(to_amend) > 0:
+            for amended_order in reversed(to_amend):
+                reference_order = [o for o in existing_orders if o['orderID'] == amended_order['orderID']][0]
+                logger.info("Amending %4s: %d @ %.*f to %d @ %.*f (%+.*f)" % (
+                    amended_order['side'],
+                    reference_order['leavesQty'], tickLog, reference_order['price'],
+                    (amended_order['orderQty'] - reference_order['cumQty']), tickLog, amended_order['price'],
+                    tickLog, (amended_order['price'] - reference_order['price'])
+                ))
+            # This can fail if an order has closed in the time we were processing.
+            # The API will send us `invalid ordStatus`, which means that the order's status (Filled/Canceled)
+            # made it not amendable.
+            # If that happens, we need to catch it and re-tick.
+            try:
+                self.exchange.amend_bulk_orders(to_amend)
+            except requests.exceptions.HTTPError as e:
+                errorObj = e.response.json()
+                if errorObj['error']['message'] == 'Invalid ordStatus':
+                    logger.warn("Amending failed. Waiting for order data to converge and retrying.")
+                    sleep(0.5)
+                    return self.place_orders()
+                else:
+                    logger.error("Unknown error on amend: %s. Exiting" % errorObj)
+                    sys.exit(1)
+
+        if len(to_create) > 0:
+            logger.info("Creating %d orders:" % (len(to_create)))
+            for order in reversed(to_create):
+                logger.info("%4s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
+            self.exchange.create_bulk_orders(to_create)
+
+            # Could happen if we exceed a delta limit
+        if len(to_cancel) > 0:
+            logger.info("Canceling %d orders:" % (len(to_cancel)))
+            for order in reversed(to_cancel):
+                logger.info("%4s %d @ %.*f" % (order['side'], order['leavesQty'], tickLog, order['price']))
+            self.exchange.cancel_bulk_orders(to_cancel)
+
+
+
+
+    def converge_orders(self, buy_orders, sell_orders, martin_signal = False):
         """Converge the orders we currently have in the book with what we want to be in the book.
            This involves amending any open orders and creating new ones if any have filled completely.
            We start from the closest orders outward."""
 
         tickLog = self.exchange.get_instrument()['tickLog']
+        position = self.exchange.get_position()
         to_amend = []
         to_create = []
         to_cancel = []
@@ -361,10 +654,22 @@ class OrderManager:
                     sells_matched += 1
 
                 # Found an existing order. Do we need to amend it?
-                if desired_order['orderQty'] != order['leavesQty'] or (
+                # if desired_order['orderQty'] != order['leavesQty'] or (
+                #         # If price has changed, and the change is more than our RELIST_INTERVAL, amend.
+                #         desired_order['price'] != order['price'] and
+                #         abs((desired_order['price'] / order['price']) - 1) > settings.RELIST_INTERVAL):
+                #     to_amend.append({'orderID': order['orderID'], 'orderQty': order['cumQty'] + desired_order['orderQty'],
+                #                      'price': desired_order['price'], 'side': order['side']})
+                if martin_signal:
+                    to_amend.append({'orderID': order['orderID'], 'orderQty': order['cumQty'] + desired_order['orderQty'],
+                                     'price': desired_order['price'], 'side': order['side']})
+
+                elif desired_order['orderQty'] != order['leavesQty']:
+                    to_amend.append(
+                        {'orderID': order['orderID'], 'orderQty': order['cumQty'] + desired_order['orderQty'],
+                         'price': order['price'], 'side': order['side']})
+                elif desired_order['price'] != order['price'] and abs((desired_order['price'] / order['price']) - 1) > settings.RELIST_INTERVAL:
                         # If price has changed, and the change is more than our RELIST_INTERVAL, amend.
-                        desired_order['price'] != order['price'] and
-                        abs((desired_order['price'] / order['price']) - 1) > settings.RELIST_INTERVAL):
                     to_amend.append({'orderID': order['orderID'], 'orderQty': order['cumQty'] + desired_order['orderQty'],
                                      'price': desired_order['price'], 'side': order['side']})
             except IndexError:
@@ -439,6 +744,22 @@ class OrderManager:
     # Sanity
     ##
 
+    def check_stable(self):
+        ticker = self.exchange.get_ticker()
+        self.buys[0:self.size - 1] = self.buys[1:self.size]
+        self.buys[-1] = ticker['buy']
+        self.sells[0:self.size - 1] = self.sells[1:self.size]
+        self.sells[-1] = ticker['sell']
+
+        if self.buys[-1] != self.buys[-3]:
+            return False
+
+        if self.sells[-1] != self.sells[-3]:
+            return False
+
+        return True
+
+
     def sanity_check(self):
         """Perform checks before placing orders."""
 
@@ -450,6 +771,7 @@ class OrderManager:
 
         # Get ticker, which sets price offsets and prints some debugging info.
         ticker = self.get_ticker()
+        # self.tick_cache.append(ticker)
 
         # Sanity check:
         if self.get_price_offset(-1) >= ticker["sell"] or self.get_price_offset(1) <= ticker["buy"]:
@@ -487,6 +809,7 @@ class OrderManager:
     def exit(self):
         logger.info("Shutting down. All open orders will be cancelled.")
         try:
+            if settings.RESET:
             self.exchange.cancel_all_orders()
             self.exchange.bitmex.exit()
         except errors.AuthenticationError as e:
@@ -521,6 +844,15 @@ class OrderManager:
 #
 # Helpers
 #
+
+def fib(n):
+    n = abs(n)
+    if n == 1:
+        return 1
+    elif n == 2:
+        return 2
+    else:
+        return fib(n - 1) + fib(n - 2)
 
 
 def XBt_to_XBT(XBt):

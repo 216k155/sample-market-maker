@@ -65,6 +65,7 @@ class BitMEXWebsocket():
         self.__wait_for_symbol(symbol)
         if self.shouldAuth:
             self.__wait_for_account()
+        self.disableAutoCancel()
         self.logger.info('Got all market data. Starting.')
 
     #
@@ -127,6 +128,9 @@ class BitMEXWebsocket():
     def recent_trades(self):
         return self.data['trade']
 
+    def disableAutoCancel(self):
+        self.__send_command("cancelAllAfter", [0])
+
     #
     # Lifecycle methods
     #
@@ -162,16 +166,17 @@ class BitMEXWebsocket():
         self.wst.daemon = True
         self.wst.start()
         self.logger.info("Started thread")
+        self.__wait_ws(lambda: self.ws.sock and self.ws.sock.connected)
 
+    def __wait_ws(self, good_condition):
         # Wait for connect before continuing
-        conn_timeout = 5
-        while (not self.ws.sock or not self.ws.sock.connected) and conn_timeout and not self._error:
+        conn_timeout = settings.TIMEOUT
+        while (not good_condition()) and conn_timeout and not self._error:
             sleep(1)
             conn_timeout -= 1
 
         if not conn_timeout or self._error:
-            self.logger.error("Couldn't connect to WS! Exiting.")
-            self.exit()
+            self.logger.error("Couldn't connect to WS: timeout! Exiting.")
             sys.exit(1)
 
     def __get_auth(self):
@@ -193,19 +198,17 @@ class BitMEXWebsocket():
     def __wait_for_account(self):
         '''On subscribe, this data will come down. Wait for it.'''
         # Wait for the keys to show up from the ws
-        while not {'margin', 'position', 'order'} <= set(self.data):
-            sleep(0.1)
+        self.__wait_ws(lambda: {'margin', 'position', 'order'} <= set(self.data))
 
     def __wait_for_symbol(self, symbol):
         '''On subscribe, this data will come down. Wait for it.'''
-        while not {'instrument', 'trade', 'quote'} <= set(self.data):
-            sleep(0.1)
+        self.__wait_ws(lambda: {'instrument', 'trade', 'quote'} <= set(self.data))
 
     def __send_command(self, command, args):
         '''Send a raw command.'''
         self.ws.send(json.dumps({"op": command, "args": args or []}))
 
-    def __on_message(self, message):
+    def __on_message(self, ws, message):
         '''Handler for parsing WS messages.'''
         message = json.loads(message)
         self.logger.debug(json.dumps(message))
@@ -289,10 +292,10 @@ class BitMEXWebsocket():
         except:
             self.logger.error(traceback.format_exc())
 
-    def __on_open(self):
+    def __on_open(self, ws):
         self.logger.debug("Websocket Opened.")
 
-    def __on_close(self):
+    def __on_close(self, ws):
         self.logger.info('Websocket Closed')
         self.exit()
 
